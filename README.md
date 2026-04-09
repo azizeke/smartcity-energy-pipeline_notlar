@@ -1,0 +1,141 @@
+# 🏙️ Smart City Enerji Optimizasyonu – Medallion ETL Pipeline
+
+Bu proje, bir akıllı şehirden gelen **enerji fiyatı, hava durumu ve hava kalitesi** verilerini işleyerek, **elektrik fiyatlarının ucuz olduğu fırsat anlarını tespit eden** bir veri mühendisliği pipeline'ıdır.
+
+📌 **Temel Hedef:**  
+> Rüzgar hızı yüksek (yenilenebilir enerji var) ve fiyat son 3 saatin ortalamasının altındaysa → **"FIRSAT"** etiketi oluştur.
+
+---
+
+## 🧱 Mimari – Medallion (Bronze / Silver / Gold)
+Bronze (Ham JSON) Silver (Temiz Delta) Gold (Analiz)
+───────────────────── ──────────────────── ─────────────────
+energy_raw.json → silver_energy ↘
+weather_raw.json → silver_weather → gold_energy_analysis
+air_quality_raw.json → silver_air_quality ↗
+
+text
+
+- **Bronze** : Orijinal JSON dosyaları (hiç dokunulmaz)
+- **Silver** : Sütun adları temizlenmiş, patlatılmış, surrogate key eklenmiş Delta tabloları
+- **Gold**   : 3 tablonun birleştirilmiş, hareketli ortalama ve fırsat etiketi eklenmiş nihai tablo
+
+---
+
+## 📁 Proje Yapısı (Notebook'lar)
+
+| Notebook | Görevi |
+|----------|--------|
+| `nb_config` | Tüm sabit değerler (lakehouse adı, yollar, full load vb.) |
+| `nb_logging` | Tarih/saatli log sistemi (artık `print()` yok) |
+| `nb_functions` | 7 adet tekrar kullanılabilir fonksiyon |
+| `nb_generic_bronze_to_silver` | **Kapsül mantığıyla** Bronze → Silver dönüşüm motoru |
+| `nb_process_silver_to_gold` | Silver → Gold join + pencere analizi |
+
+---
+
+## ⚙️ nb_config – Tek Doğruluk Kaynağı
+
+**Problem:** Aynı yolu 50 yere yazmak.  
+**Çözüm:** Tüm sabitler tek bir yerde.
+
+```python
+LAKEHOUSE_NAME = "SmartCity_Lakehouse"
+ROOT_PATH = f"abfss://{LAKEHOUSE_NAME}@onelake.dfs.fabric.microsoft.com/{LAKEHOUSE_NAME}.Lakehouse/Files"
+
+PATH_BRONZE = f"{ROOT_PATH}/bronze"
+PATH_SILVER = f"{ROOT_PATH}/silver"
+PATH_GOLD   = f"{ROOT_PATH}/gold"
+
+FULL_LOAD = True   # her seferinde tam yükleme
+✅ Lakehouse ismini değiştirmek → tek satır.
+
+📝 nb_logging – Kara Kutu
+Problem: print() ile tarih/saat ve seviye kayboluyor.
+Çözüm: Python logging ile kalıcı, izlenebilir log.
+
+python
+logger = get_logger(__name__)
+logger.info("==== ENERGY işleniyor ====")
+logger.error("Dosya bulunamadı")
+Örnek çıktı:
+
+text
+2026-04-08 21:08:16 - nb_generic_bronze_to_silver - INFO - ==== ENERGY işleniyor ====
+2026-04-08 21:08:32 - nb_generic_bronze_to_silver - INFO - ==== ENERGY tamamlandı ====
+🧰 nb_functions – Araç Kutusu (7 fonksiyon)
+Fonksiyon	Ne işe yarar?
+clean_column_names	"First Name" → "first_name"
+explode_and_flatten	İç içe JSON'u düz tabloya çevirir
+save_to_lakehouse	Delta formatında kaydeder
+generate_surrogate_key	MD5 ile yapay anahtar oluşturur
+create_time_series_frame	Timestamp formatlarını düzeltip sıralar
+select_columns_safe	Sütun yoksa hata vermez, atlar
+join_dataframes	İki tabloyu birleştirir
+✅ Bir kez yaz → her yerde kullan.
+
+🧠 nb_generic_bronze_to_silver – Kapsül Motoru
+Problem: Her veri için ayrı kod yazmak.
+Çözüm: Metadata-driven ETL (kapsül mantığı)
+
+python
+capsules = {
+    "energy": {
+        "source"  : "Files/bronze/energy/energy_raw.json",
+        "table"   : "silver_energy",
+        "explode" : "prices",
+        "columns" : ["readingDate", "price"]
+    },
+    "weather": {...},
+    "air_quality": {...}
+}
+Sihir: Yeni bir veri seti geldiğinde sadece yukarıya bir kapsül ekle.
+Ana işleme kodu asla değişmez.
+
+💡 Tıpkı çamaşır makinesi: makine aynı, program değişir.
+
+🔗 nb_process_silver_to_gold – Analiz Motoru
+3 Silver tabloyu oku (silver_energy, silver_weather, silver_air_quality)
+
+Timestamp formatlarını eşitle (substring(1,16))
+
+Left join ile birleştir (timestamp üzerinden)
+
+3 saatlik hareketli ortalama (avg_price_3h)
+
+FIRSAT etiketi ekle:
+
+python
+F.when(
+    (F.col("price") < F.col("avg_price_3h")) &
+    (F.col("wind_speed_10m") > 20), "FIRSAT"
+).otherwise("NORMAL")
+Gold tabloya kaydet → gold_energy_analysis
+
+📊 Örnek Çıktı (gold_energy_analysis)
+timestamp	price	wind_speed	avg_price_3h	opportunity
+2024-12-01 00:00	0.05	32.2	0.08	FIRSAT
+2024-12-01 01:00	0.08	28.4	0.065	NORMAL
+🚀 Çalıştırma Sırası (Kesinlikle bu sırayla)
+bash
+1. nb_config
+2. nb_logging
+3. nb_functions
+4. nb_generic_bronze_to_silver
+5. nb_process_silver_to_gold
+⚠️ Her notebook'un en başında %run nb_config vb. komutlar bulunur.
+Bu sayede değişkenler ve fonksiyonlar otomatik yüklenir.
+
+🧪 Kullanılan Teknolojiler
+Microsoft Fabric / Lakehouse
+
+Apache Spark (PySpark)
+
+Delta Lake
+
+Python logging
+
+Notebook mimarisi (Medallion)
+
+📌 Lisans
+Bu proje eğitim ve portfolyo amaçlıdır. İstediğin gibi kullanabilir / geliştirebilirsin.
